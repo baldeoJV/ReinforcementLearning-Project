@@ -9,7 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 import random
 import os
 import cv2
-
+import numpy as np
 
 class Agent():
 
@@ -95,100 +95,138 @@ class Agent():
             obs = self.process_observation(next_obs)
 
             episode_reward += reward
-
+    
 
     def train(self, episodes, max_episode_steps, summary_writer_suffix, batch_size, epsilon, epsilon_decay, min_epsilon):
 
-        summary_writer_name = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{summary_writer_suffix}'
-        writer = SummaryWriter(summary_writer_name)
+            # Save TensorBoard logs in the same directory as the script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            summary_writer_name = os.path.join(
+                script_dir, 'runs',
+                f'{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{summary_writer_suffix}'
+            )
+            writer = SummaryWriter(summary_writer_name)
 
-        if not os.path.exists('models'):
-            os.makedirs('models')
+            if not os.path.exists('models'):
+                os.makedirs('models')
 
-        total_steps = 0
+            total_steps = 0
+            reward_history, loss_history, qvalue_history = [], [], []
 
-        #TRAINING LOOP
-        for episode in range(episodes):
+            print(f"TensorBoard logs → {summary_writer_name}")
 
-            done = False
-            episode_reward = 0
-            obs, info = self.env.reset()
-            obs = self.process_observation(obs)
+            for episode in range(episodes):
+                done = False
+                episode_reward = 0
+                obs, info = self.env.reset()
+                obs = self.process_observation(obs)
+                episode_steps = 0
+                episode_losses, episode_qvalues, td_errors, action_counts = [], [], [], []
 
-            episode_steps = 0
+                episode_start_time = time.time()
 
-            episode_start_time = time.time()
+                while not done and episode_steps < max_episode_steps:
+                    # ε-greedy action selection
+                    if random.random() < epsilon:
+                        action = self.env.action_space.sample()
+                    else:
+                        q_values = self.model.forward(obs.unsqueeze(0).to(self.device))[0]
+                        action = torch.argmax(q_values, dim=-1).item()
+                        episode_qvalues.append(q_values.mean().item())
 
-            while not done and episode_steps < max_episode_steps:
+                    action_counts.append(action)
 
-                if random.random() < epsilon:
-                    action = self.env.action_space.sample()
-                else:
-                    q_values = self.model.forward(obs.unsqueeze(0).to(self.device))[0]
-                    action = torch.argmax(q_values, dim=-1).item()
-                
-                reward = 0
+                    reward = 0
+                    for _ in range(self.step_repeat):
+                        next_obs, reward_temp, done, truncated, info = self.env.step(action=action)
+                        reward += reward_temp
+                        if done:
+                            break
 
-                for i in range(self.step_repeat):
-                    reward_temp = 0
+                    next_obs = self.process_observation(next_obs)
+                    self.memory.store_transition(obs, action, reward, next_obs, done)
+                    obs = next_obs
 
-                    next_obs, reward_temp, done, truncated, info = self.env.step(action=action)
+                    episode_reward += reward
+                    episode_steps += 1
+                    total_steps += 1
 
-                    reward += reward_temp
+                    # Training updates
+                    if self.memory.can_sample(batch_size):
+                        observations, actions, rewards, next_observations, dones = self.memory.sample_buffer(batch_size)
+                        dones = dones.unsqueeze(1).float()
 
-                    if(done):
-                        break
-                
-                next_obs = self.process_observation(next_obs)
+                        # Q(s,a)
+                        q_values = self.model(observations)
+                        actions = actions.unsqueeze(1).long()
+                        qsa_batch = q_values.gather(1, actions)
 
-                self.memory.store_transition(obs, action, reward, next_obs, done)
+                        # Q-target(s’, a’)
+                        next_actions = torch.argmax(self.model(next_observations), dim=1, keepdim=True)
+                        next_q_values = self.target_model(next_observations).gather(1, next_actions)
+                        target_b = rewards.unsqueeze(1) + (1 - dones) * self.gamma * next_q_values
 
-                obs = next_obs
+                        # TD error & loss
+                        td_error = (target_b.detach() - qsa_batch)
+                        loss = F.mse_loss(qsa_batch, target_b.detach())
 
-                episode_reward += reward
-                episode_steps += 1
-                total_steps += 1
+                        episode_losses.append(loss.item())
+                        td_errors.extend(td_error.abs().detach().cpu().numpy().flatten().tolist())
 
-                if self.memory.can_sample(batch_size):
 
-                    observations, actions, rewards, next_observations, dones = self.memory.sample_buffer(batch_size)
+                        # Optimization step
+                        self.model.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
 
-                    dones = dones.unsqueeze(1).float()
+                        if episode_steps % 4 == 0:
+                            soft_update(self.target_model, self.model)
 
-                    # Current Q-Values from both models
-                    q_values = self.model(observations)
-                    actions = actions.unsqueeze(1).long()
-                    qsa_batch = q_values.gather(1, actions)
+                        # Log per-step metrics
+                        writer.add_scalar("Loss/step", loss.item(), total_steps)
+                        writer.add_scalar("QValue/mean", q_values.mean().item(), total_steps)
+                        writer.add_scalar("QValue/max", q_values.max().item(), total_steps)
+                        writer.add_scalar("TD_Error/mean", td_error.abs().mean().item(), total_steps)
 
-                    next_actions = torch.argmax(self.model(next_observations), dim=1, keepdim=True)
+                # Model checkpoint
+                self.model.save_the_model()
 
-                    next_q_values = self.target_model(next_observations).gather(1, next_actions)
+                # Episode metrics
+                episode_time = time.time() - episode_start_time
+                avg_loss = np.mean(episode_losses) if episode_losses else 0
+                avg_qvalue = np.mean(episode_qvalues) if episode_qvalues else 0
+                avg_td_error = np.mean(td_errors) if td_errors else 0
+                fps = episode_steps / episode_time if episode_time > 0 else 0
+                avg_reward = np.mean(reward_history[-10:]) if reward_history else 0
 
-                    target_b = rewards.unsqueeze(1) + (1 - dones) * self.gamma * next_q_values
+                reward_history.append(episode_reward)
+                loss_history.append(avg_loss)
+                qvalue_history.append(avg_qvalue)
 
-                    loss = F.mse_loss(qsa_batch, target_b.detach())
+                # TensorBoard logs (episode level)
+                writer.add_scalar('Score/Episode', episode_reward, episode)
+                writer.add_scalar('Score/Avg10', avg_reward, episode)
+                writer.add_scalar('Loss/Episode', avg_loss, episode)
+                writer.add_scalar('QValue/Avg', avg_qvalue, episode)
+                writer.add_scalar('TD_Error/EpisodeMean', avg_td_error, episode)
+                writer.add_scalar('Epsilon', epsilon, episode)
+                writer.add_scalar('Performance/FPS', fps, episode)
+                writer.add_scalar('Performance/EpisodeTime', episode_time, episode)
 
-                    writer.add_scalar("Loss/model", loss.item(), total_steps)
+                # Action distribution histogram
+                writer.add_histogram('Action/Distribution', np.array(action_counts), episode)
 
-                    self.model.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                # Console output
+                print(f"\nEpisode {episode + 1}/{episodes}")
+                print(f"  Reward: {episode_reward:.2f}  |  Avg(10): {avg_reward:.2f}")
+                print(f"  Avg Loss: {avg_loss:.6f}  |  Avg Q: {avg_qvalue:.3f}  |  TD Error: {avg_td_error:.4f}")
+                print(f"  Steps: {episode_steps}  |  FPS: {fps:.2f}  |  Time: {episode_time:.2f}s")
+                print(f"  Epsilon: {epsilon:.4f}")
 
-                    if episode_steps % 4 == 0:
-                        soft_update(self.target_model, self.model)
-                    
-            
-            self.model.save_the_model()
+                # Epsilon decay
+                if epsilon > min_epsilon:
+                    epsilon *= epsilon_decay
 
-            writer.add_scalar('Score', episode_reward, episode)
-            writer.add_scalar('Epsilon', epsilon, episode)
-
-            if epsilon > min_epsilon:
-                epsilon *= epsilon_decay
-            
-            episode_time = time.time() - episode_start_time
-
-            print(f"Completed episode {episode} with score {episode_reward}")
-            print(f"Episode Time: {episode_time:1f} seconds")
-            print(f"Episode Steps: {episode_steps}")
-
+            writer.close()
+            print("\n✅ Training complete! You can now view metrics with:")
+            print(f"   tensorboard --logdir {os.path.join(script_dir, 'runs')}")
