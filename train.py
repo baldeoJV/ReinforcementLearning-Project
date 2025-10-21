@@ -8,7 +8,7 @@ import cv2
 def to_grayscale(obs):
     return cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
 
-episodes = 100
+episodes = 2500
 max_episode_steps = 5000
 hidden_layer = 128
 learning_rate = 0.0001
